@@ -7,13 +7,14 @@ app = Flask(__name__)
 salas_activas = {}
 
 # Regex centralizado igual que en x.py
-CODIGO_REGEX = re.compile(r"U[A-Z0-9]{6,10}")
+CODIGO_REGEX = re.compile(r"U[A-Z0-9]{7}")  # 8 chars total: U + 7, variable UCAC7D1E, UD04AB08, U0D4D853
 
 def es_codigo_valido(codigo: str) -> bool:
     if not codigo:
         return False
     codigo = codigo.strip().upper()
-    return bool(re.fullmatch(r"U[A-Z0-9]{6,10}", codigo) and any(c.isdigit() for c in codigo))
+    # 8 chars totales: U + 7 alfanum, variable, ej UCAC7D1E, UD04AB08, U0D4D853
+    return bool(re.fullmatch(r"U[A-Z0-9]{7}", codigo) or re.fullmatch(r"U[A-Z0-9]{6,10}", codigo))
 
 def limpiar_expiradas(max_age=600):
     """Borra salas con mas de 10 min (antes tenias 7200 = 2hs)"""
