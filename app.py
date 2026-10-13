@@ -1,24 +1,25 @@
 from flask import Flask, request, jsonify
 import time
+import re
 
 app = Flask(__name__)
 
-# Memoria temporal para almacenar las salas activas
 salas_activas = {}
 
 @app.route('/crear', methods=['POST'])
 def crear_sala():
     data = request.json
-    codigo = data.get("codigo")
+    codigo = data.get("codigo", "").strip().upper()
     ip = data.get("ip")
     puerto = data.get("puerto")
     juego = data.get("juego", "Juego desconocido")
     host = data.get("host", "Player")
     
-    if not codigo or not ip or not puerto:
-        return jsonify({"error": "Faltan datos"}), 400
+    # Validar que el código tenga formato correcto y OBLIGATORIAMENTE al menos un número
+    if not codigo or not ip or not puerto or not any(c.isdigit() for c in codigo) or not re.fullmatch(r"U[A-Z0-9]{6,10}", codigo):
+        return jsonify({"error": "Código inválido o prohibido"}), 400
         
-    salas_activas[codigo.upper()] = {
+    salas_activas[codigo] = {
         "ip": ip,
         "puerto": puerto,
         "juego": juego,
@@ -29,9 +30,12 @@ def crear_sala():
 
 @app.route('/salas', methods=['GET'])
 def listar_salas():
-    # Limpia automáticamente salas inactivas de más de 2 horas
     ahora = time.time()
-    activas = {k: v for k, v in salas_activas.items() if ahora - v.get("time", ahora) < 7200}
+    # Limpiar y filtrar solo códigos válidos con números y antigüedad menor a 2 horas
+    activas = {}
+    for k, v in salas_activas.items():
+        if ahora - v.get("time", ahora) < 7200 and any(c.isdigit() for c in k) and re.fullmatch(r"U[A-Z0-9]{6,10}", k):
+            activas[k] = v
     return jsonify(activas)
 
 @app.route('/unirse/<codigo>', methods=['GET'])
