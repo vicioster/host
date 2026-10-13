@@ -23,7 +23,7 @@ def unirse_sala(codigo):
     codigo = codigo.upper()
     if codigo in salas_activas:
         return jsonify(salas_activas[codigo])
-    return jsonify({"error": "Sala no encontrada"}}, 404
+    return jsonify({"error": "Sala no encontrada"}), 404
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
