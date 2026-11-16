@@ -1,11 +1,37 @@
 from flask import Flask, request, jsonify
-import time, re, threading
+import time, re, threading, json, os
+from pathlib import Path
 try:
     import requests as _req
 except Exception:
     _req = None
 app = Flask(__name__)
 salas_activas = {}
+# Archivo compartido: si Render corre con varios workers, el dict en memoria
+# de cada worker es distinto y un worker borra pero otro sigue listando la sala.
+# Con archivo, todos leen/escriben el mismo estado.
+_SALAS_FILE = Path(os.environ.get("SALAS_FILE", "/tmp/salas_activas.json"))
+_SALAS_LOCK = threading.Lock()
+
+def _load_salas():
+    try:
+        with _SALAS_LOCK:
+            if _SALAS_FILE.exists():
+                data = json.loads(_SALAS_FILE.read_text(encoding="utf-8") or "{}")
+                if isinstance(data, dict):
+                    salas_activas.clear()
+                    salas_activas.update(data)
+    except Exception as e:
+        print(f"[SALAS] load error: {e}")
+
+def _save_salas():
+    try:
+        with _SALAS_LOCK:
+            tmp = _SALAS_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(salas_activas), encoding="utf-8")
+            tmp.replace(_SALAS_FILE)
+    except Exception as e:
+        print(f"[SALAS] save error: {e}")
 _country_cache = {}
 _country_lock = threading.Lock()
 
@@ -58,7 +84,9 @@ def es_codigo_valido(codigo: str) -> bool:
     return bool(re.fullmatch(r"U[A-Z0-9]{7}", codigo) or re.fullmatch(r"U[A-Z0-9]{6,10}", codigo))
 
 def limpiar_expiradas(max_age=600):
+    _load_salas()
     ahora = time.time()
+    _changed = False
     for k in list(salas_activas.keys()):
         v = salas_activas.get(k)
         if not v: continue
@@ -71,6 +99,7 @@ def limpiar_expiradas(max_age=600):
             if v.get("player2") and p2t and ahora - p2t > 120:
                 v["player2"] = ""; v["player2_time"] = 0
                 v["player2_country_code"] = ""; v["player2_pais"] = ""; v["player2_flag"] = "🌐"
+                _changed = True
 
 def _extraer_codigo(codigo_url=None):
     if codigo_url: return codigo_url.strip().upper()
@@ -98,11 +127,14 @@ def _extraer_jugador():
 def _borrar(codigo: str) -> bool:
     codigo = (codigo or "").strip().upper()
     if not codigo: return False
+    _load_salas()
     if codigo in salas_activas:
         del salas_activas[codigo]
-        print(f"[BORRAR] {codigo} borrado")
+        _save_salas()
+        print(f"[BORRAR] {codigo} borrado (persistido)")
         return True
-    return False
+    print(f"[BORRAR] {codigo} ya no estaba (idempotente 200)")
+    return True
 
 @app.route('/crear', methods=['POST'])
 def crear_sala():
@@ -123,6 +155,7 @@ def crear_sala():
                              "espectadores": 0,
                              "host_country_code": code, "host_pais": name, "host_flag": flag,
                              "country_code": code, "pais": name, "flag": flag}
+    _save_salas()
     print(f"[CREAR] {codigo} -> {ip}:{puerto} ({juego}) por {host} {flag} {code}")
     return jsonify({"status": "ok", "codigo": codigo})
 
@@ -145,6 +178,7 @@ def unirse_sala(codigo):
     jugador = _extraer_jugador()
     if rol in ("spectator", "espectador"):
         sala["espectadores"] = sala.get("espectadores", 0) + 1
+        _save_salas()
         return jsonify({"status": "ok", "codigo": codigo, "rol": "spectator"})
     if not jugador:
         return jsonify({"error": "falta jugador"}), 400
@@ -161,6 +195,7 @@ def unirse_sala(codigo):
     sala["player2_country_code"] = code
     sala["player2_pais"] = name
     sala["player2_flag"] = flag
+    _save_salas()
     print(f"[UNIRSE] {jugador} {flag} {code} -> {codigo} ({sala.get('host')} vs {jugador})")
     return jsonify({"status": "ok", "codigo": codigo, "host": sala.get("host"), "player2": jugador})
 
@@ -169,6 +204,7 @@ def unirse_sala(codigo):
 def salir_sala(codigo=None):
     codigo = _extraer_codigo(codigo)
     jugador = _extraer_jugador()
+    _load_salas()
     if not codigo:
         return jsonify({"error": "falta codigo"}), 400
     if codigo in salas_activas:
@@ -177,6 +213,7 @@ def salir_sala(codigo=None):
         if not jugador or not actual or actual.lower() == jugador.lower():
             sala["player2"] = ""; sala["player2_time"] = 0
             sala["player2_country_code"] = ""; sala["player2_pais"] = ""; sala["player2_flag"] = "🌐"
+            _save_salas()
             print(f"[SALIR] {jugador} salio de {codigo}")
     return jsonify({"status": "ok", "codigo": codigo})
 
@@ -214,6 +251,7 @@ def ping():
 @app.route('/salas/<codigo>', methods=['DELETE','GET'])
 def borrar_por_salas(codigo):
     codigo = _extraer_codigo(codigo)
+    _load_salas()
     if request.method == 'GET':
         if codigo in salas_activas: return jsonify(salas_activas[codigo])
         return jsonify({"error": "Sala no encontrada"}), 404
@@ -221,6 +259,7 @@ def borrar_por_salas(codigo):
 
 @app.route('/', methods=['GET'])
 def index():
+    _load_salas()
     return jsonify({"status": "ok", "salas_activas": len(salas_activas)})
 
 if __name__ == '__main__':
