@@ -5,11 +5,9 @@ try:
     import requests as _req
 except Exception:
     _req = None
+
 app = Flask(__name__)
 salas_activas = {}
-# Archivo compartido: si Render corre con varios workers, el dict en memoria
-# de cada worker es distinto y un worker borra pero otro sigue listando la sala.
-# Con archivo, todos leen/escriben el mismo estado.
 _SALAS_FILE = Path(os.environ.get("SALAS_FILE", "/tmp/salas_activas.json"))
 _SALAS_LOCK = threading.Lock()
 
@@ -32,6 +30,7 @@ def _save_salas():
             tmp.replace(_SALAS_FILE)
     except Exception as e:
         print(f"[SALAS] save error: {e}")
+
 _country_cache = {}
 _country_lock = threading.Lock()
 
@@ -42,7 +41,6 @@ def _flag_for_code(code: str) -> str:
     return chr(127397 + ord(code[0])) + chr(127397 + ord(code[1]))
 
 def _get_country(ip: str):
-    """IP -> (codigo, nombre, bandera). Cache 24h. Solo pais."""
     ip = (ip or "").strip()
     if not ip or ip in ("127.0.0.1", "::1", ""):
         return ("", "", "🌐")
@@ -92,14 +90,18 @@ def limpiar_expiradas(max_age=600):
         if not v: continue
         if ahora - v.get("time", ahora) > max_age:
             del salas_activas[k]
+            _changed = True
         elif not es_codigo_valido(k):
             del salas_activas[k]
+            _changed = True
         else:
             p2t = v.get("player2_time")
             if v.get("player2") and p2t and ahora - p2t > 120:
                 v["player2"] = ""; v["player2_time"] = 0
                 v["player2_country_code"] = ""; v["player2_pais"] = ""; v["player2_flag"] = "🌐"
                 _changed = True
+    if _changed:
+        _save_salas()
 
 def _extraer_codigo(codigo_url=None):
     if codigo_url: return codigo_url.strip().upper()
@@ -131,9 +133,9 @@ def _borrar(codigo: str) -> bool:
     if codigo in salas_activas:
         del salas_activas[codigo]
         _save_salas()
-        print(f"[BORRAR] {codigo} borrado (persistido)")
+        print(f"[BORRAR] {codigo} borrado y persistido")
         return True
-    print(f"[BORRAR] {codigo} ya no estaba (idempotente 200)")
+    print(f"[BORRAR] {codigo} ya no estaba")
     return True
 
 @app.route('/crear', methods=['POST'])
@@ -162,12 +164,14 @@ def crear_sala():
 @app.route('/salas', methods=['GET'])
 def listar_salas():
     limpiar_expiradas(max_age=600)
+    _load_salas()
     return jsonify({k: v for k, v in salas_activas.items() if es_codigo_valido(k)})
 
 @app.route('/unirse/<codigo>', methods=['GET', 'POST'])
 def unirse_sala(codigo):
     codigo = codigo.upper().strip()
     limpiar_expiradas()
+    _load_salas()
     if codigo not in salas_activas:
         return jsonify({"error": "Sala no encontrada"}), 404
     sala = salas_activas[codigo]
@@ -196,7 +200,7 @@ def unirse_sala(codigo):
     sala["player2_pais"] = name
     sala["player2_flag"] = flag
     _save_salas()
-    print(f"[UNIRSE] {jugador} {flag} {code} -> {codigo} ({sala.get('host')} vs {jugador})")
+    print(f"[UNIRSE] {jugador} {flag} {code} -> {codigo}")
     return jsonify({"status": "ok", "codigo": codigo, "host": sala.get("host"), "player2": jugador})
 
 @app.route('/salir/<codigo>', methods=['POST', 'DELETE', 'GET'])
@@ -214,48 +218,36 @@ def salir_sala(codigo=None):
             sala["player2"] = ""; sala["player2_time"] = 0
             sala["player2_country_code"] = ""; sala["player2_pais"] = ""; sala["player2_flag"] = "🌐"
             _save_salas()
-            print(f"[SALIR] {jugador} salio de {codigo}")
     return jsonify({"status": "ok", "codigo": codigo})
 
 @app.route('/borrar/<codigo>', methods=['DELETE','GET','POST'])
-def borrar_sala(codigo):
-    codigo = _extraer_codigo(codigo); _borrar(codigo)
-    return jsonify({"status": "borrado", "codigo": codigo})
-
 @app.route('/borrar', methods=['POST','DELETE','GET'])
-def borrar_sin():
-    codigo = _extraer_codigo()
-    if not codigo: return jsonify({"error": "falta codigo"}), 400
-    _borrar(codigo); return jsonify({"status": "borrado", "codigo": codigo})
-
 @app.route('/eliminar', methods=['POST','DELETE','GET'])
 @app.route('/eliminar/<codigo>', methods=['POST','DELETE','GET'])
-def eliminar_sala_post(codigo=None):
-    codigo = _extraer_codigo(codigo)
-    if not codigo: return jsonify({"error": "falta codigo"}), 400
-    _borrar(codigo); return jsonify({"status": "borrado", "codigo": codigo})
-
 @app.route('/cerrar', methods=['POST','DELETE','GET'])
 @app.route('/cerrar/<codigo>', methods=['POST','DELETE','GET'])
 @app.route('/terminar', methods=['POST','DELETE','GET'])
 @app.route('/terminar/<codigo>', methods=['POST','DELETE','GET'])
-def cerrar_sala(codigo=None):
-    codigo = _extraer_codigo(codigo)
-    if not codigo: return jsonify({"error": "falta codigo"}), 400
-    _borrar(codigo); return jsonify({"status": "borrado", "codigo": codigo})
+def eliminar_sala_generica(codigo=None):
+    c = _extraer_codigo(codigo)
+    if not c:
+        return jsonify({"error": "falta codigo"}), 400
+    _borrar(c)
+    return jsonify({"status": "borrado", "codigo": c})
+
+@app.route('/salas/<codigo>', methods=['DELETE','GET'])
+def borrar_por_salas(codigo):
+    c = _extraer_codigo(codigo)
+    if request.method == 'GET':
+        _load_salas()
+        if c in salas_activas: return jsonify(salas_activas[c])
+        return jsonify({"error": "Sala no encontrada"}), 404
+    _borrar(c)
+    return jsonify({"status": "borrado", "codigo": c})
 
 @app.route('/ping', methods=['GET'])
 def ping():
     return jsonify({"status": "ok"})
-
-@app.route('/salas/<codigo>', methods=['DELETE','GET'])
-def borrar_por_salas(codigo):
-    codigo = _extraer_codigo(codigo)
-    _load_salas()
-    if request.method == 'GET':
-        if codigo in salas_activas: return jsonify(salas_activas[codigo])
-        return jsonify({"error": "Sala no encontrada"}), 404
-    _borrar(codigo); return jsonify({"status": "borrado", "codigo": codigo})
 
 @app.route('/', methods=['GET'])
 def index():
