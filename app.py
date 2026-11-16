@@ -70,11 +70,14 @@ def _pais_desde_payload(data: dict, ip: str):
     code = (data.get("country_code") or data.get("host_country_code") or data.get("player2_country_code") or "").strip().upper()
     name = (data.get("pais") or data.get("host_pais") or data.get("player2_pais") or data.get("country") or "").strip()
     flag = (data.get("flag") or data.get("host_flag") or data.get("player2_flag") or "").strip()
-    if code and not flag:
+    # Si flag llegó como código de 2 letras (ej. "AR"), convertirlo a emoji
+    if flag and len(flag) == 2 and flag.isalpha():
+        flag = _flag_for_code(flag.upper())
+    if code and (not flag or flag == "🌐"):
         flag = _flag_for_code(code)
     if not code and ip:
         code, name, flag = _get_country(ip)
-    if not flag:
+    if not flag or (len(flag) == 2 and flag.isalpha()):
         flag = _flag_for_code(code)
     return (code, name, flag)
 
@@ -83,7 +86,11 @@ def es_codigo_valido(codigo: str) -> bool:
     codigo = codigo.strip().upper()
     return bool(re.fullmatch(r"U[A-Z0-9]{7}", codigo) or re.fullmatch(r"U[A-Z0-9]{6,10}", codigo))
 
-def limpiar_expiradas(max_age=600):
+def limpiar_expiradas(max_age=90):
+    """Expira salas sin actividad reciente.
+    El cliente host envía keepalive cada ~25s, así 90s sin update = sala muerta.
+    Antes era 600s y las salas quedaban colgadas al cerrar el emulador.
+    """
     _load_salas()
     ahora = time.time()
     _changed = False
@@ -92,14 +99,19 @@ def limpiar_expiradas(max_age=600):
         if not v: continue
         if ahora - v.get("time", ahora) > max_age:
             del salas_activas[k]
+            _changed = True
+            print(f"[EXPIRA] {k} (sin keepalive > {max_age}s)")
         elif not es_codigo_valido(k):
             del salas_activas[k]
+            _changed = True
         else:
             p2t = v.get("player2_time")
-            if v.get("player2") and p2t and ahora - p2t > 120:
+            if v.get("player2") and p2t and ahora - p2t > 90:
                 v["player2"] = ""; v["player2_time"] = 0
                 v["player2_country_code"] = ""; v["player2_pais"] = ""; v["player2_flag"] = "🌐"
                 _changed = True
+    if _changed:
+        _save_salas()
 
 def _extraer_codigo(codigo_url=None):
     if codigo_url: return codigo_url.strip().upper()
@@ -145,23 +157,32 @@ def crear_sala():
     if not codigo or not ip or not puerto or not es_codigo_valido(codigo):
         return jsonify({"error": "Código inválido o prohibido"}), 400
     limpiar_expiradas()
+    # Borrar otras salas del mismo IP (excepto esta misma, para permitir keepalive)
     for k in list(salas_activas.keys()):
-        if salas_activas[k].get("ip") == ip: del salas_activas[k]
+        if k != codigo and salas_activas[k].get("ip") == ip:
+            del salas_activas[k]
     code, name, flag = _pais_desde_payload(data, ip)
-    salas_activas[codigo] = {"ip": ip, "puerto": puerto, "juego": juego,
-                             "host": host, "time": time.time(),
-                             "player2": "", "player2_time": 0,
-                             "player2_country_code": "", "player2_pais": "", "player2_flag": "🌐",
-                             "espectadores": 0,
-                             "host_country_code": code, "host_pais": name, "host_flag": flag,
-                             "country_code": code, "pais": name, "flag": flag}
+    # Si la sala ya existe (keepalive), preservar player2 y espectadores
+    prev = salas_activas.get(codigo) or {}
+    salas_activas[codigo] = {
+        "ip": ip, "puerto": puerto, "juego": juego,
+        "host": host, "time": time.time(),
+        "player2": prev.get("player2", ""),
+        "player2_time": prev.get("player2_time", 0),
+        "player2_country_code": prev.get("player2_country_code", ""),
+        "player2_pais": prev.get("player2_pais", ""),
+        "player2_flag": prev.get("player2_flag", "🌐"),
+        "espectadores": prev.get("espectadores", 0),
+        "host_country_code": code, "host_pais": name, "host_flag": flag,
+        "country_code": code, "pais": name, "flag": flag,
+    }
     _save_salas()
     print(f"[CREAR] {codigo} -> {ip}:{puerto} ({juego}) por {host} {flag} {code}")
     return jsonify({"status": "ok", "codigo": codigo})
 
 @app.route('/salas', methods=['GET'])
 def listar_salas():
-    limpiar_expiradas(max_age=600)
+    limpiar_expiradas(max_age=90)
     return jsonify({k: v for k, v in salas_activas.items() if es_codigo_valido(k)})
 
 @app.route('/unirse/<codigo>', methods=['GET', 'POST'])
