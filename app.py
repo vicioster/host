@@ -105,10 +105,17 @@ def limpiar_expiradas(max_age=90):
             del salas_activas[k]
             _changed = True
         else:
-            p2t = v.get("player2_time")
-            if v.get("player2") and p2t and ahora - p2t > 90:
-                v["player2"] = ""; v["player2_time"] = 0
-                v["player2_country_code"] = ""; v["player2_pais"] = ""; v["player2_flag"] = "🌐"
+            # NO borrar player2 por timeout aca. ESTE ERA EL BUG DEL ESPECTADOR:
+            # el host hace keepalive cada 25s y el P2 cada 30s, pero si un
+            # heartbeat se demoraba >90s (Render lento / red), esto borraba
+            # al P2 en mitad de la partida y el lobby volvia a mostrar
+            # "Esperando rival...". Entonces el 3ro hacia doble click,
+            # el cliente veia player2 vacio y lo mandaba a JUGAR en vez
+            # de preguntar por espectador (o chocaba con 409 sala llena).
+            # Ahora el P2 solo se borra con /salir explicito, o cuando
+            # expira TODA la sala (sin keepalive del host >90s, arriba).
+            if "status" not in v:
+                v["status"] = "en_curso" if v.get("player2") else "esperando"
                 _changed = True
     if _changed:
         _save_salas()
@@ -164,11 +171,15 @@ def crear_sala():
     code, name, flag = _pais_desde_payload(data, ip)
     # Si la sala ya existe (keepalive), preservar player2 y espectadores
     prev = salas_activas.get(codigo) or {}
+    _p2 = prev.get("player2", "")
     salas_activas[codigo] = {
         "ip": ip, "puerto": puerto, "juego": juego,
         "host": host, "time": time.time(),
-        "player2": prev.get("player2", ""),
-        "player2_time": prev.get("player2_time", 0),
+        "player2": _p2,
+        # Host vivo = partida viva: el keepalive del host renueva tambien
+        # al P2. Si el P2 salio, /salir ya lo borro y _p2 es "".
+        "player2_time": time.time() if _p2 else prev.get("player2_time", 0),
+        "status": "en_curso" if _p2 else "esperando",
         "player2_country_code": prev.get("player2_country_code", ""),
         "player2_pais": prev.get("player2_pais", ""),
         "player2_flag": prev.get("player2_flag", "🌐"),
@@ -183,7 +194,15 @@ def crear_sala():
 @app.route('/salas', methods=['GET'])
 def listar_salas():
     limpiar_expiradas(max_age=90)
-    return jsonify({k: v for k, v in salas_activas.items() if es_codigo_valido(k)})
+    out = {}
+    for k, v in salas_activas.items():
+        if not es_codigo_valido(k):
+            continue
+        v = dict(v)
+        # Status explicito para que el cliente no dependa solo del nombre del P2
+        v["status"] = "en_curso" if v.get("player2") else "esperando"
+        out[k] = v
+    return jsonify(out)
 
 @app.route('/unirse/<codigo>', methods=['GET', 'POST'])
 def unirse_sala(codigo):
@@ -193,14 +212,18 @@ def unirse_sala(codigo):
         return jsonify({"error": "Sala no encontrada"}), 404
     sala = salas_activas[codigo]
     if request.method == 'GET':
-        return jsonify(sala)
+        _s = dict(sala)
+        _s["status"] = "en_curso" if _s.get("player2") else "esperando"
+        return jsonify(_s)
     data = request.get_json(silent=True) or {}
     rol = (data.get("rol") or "").strip().lower()
     jugador = _extraer_jugador()
     if rol in ("spectator", "espectador"):
         sala["espectadores"] = sala.get("espectadores", 0) + 1
         _save_salas()
-        return jsonify({"status": "ok", "codigo": codigo, "rol": "spectator"})
+        return jsonify({"status": "ok", "codigo": codigo, "rol": "spectator",
+                        "player2": sala.get("player2", ""), "host": sala.get("host", ""),
+                        "room_status": sala.get("status") or ("en_curso" if sala.get("player2") else "esperando")})
     if not jugador:
         return jsonify({"error": "falta jugador"}), 400
     actual = (sala.get("player2") or "").strip()
@@ -213,6 +236,7 @@ def unirse_sala(codigo):
     code, name, flag = _pais_desde_payload(data, ip_p2)
     sala["player2"] = jugador
     sala["player2_time"] = time.time()
+    sala["status"] = "en_curso"
     sala["player2_country_code"] = code
     sala["player2_pais"] = name
     sala["player2_flag"] = flag
@@ -225,15 +249,25 @@ def unirse_sala(codigo):
 def salir_sala(codigo=None):
     codigo = _extraer_codigo(codigo)
     jugador = _extraer_jugador()
+    data = request.get_json(silent=True) or {}
+    rol = (data.get("rol") or "").strip().lower() if isinstance(data, dict) else ""
     _load_salas()
     if not codigo:
         return jsonify({"error": "falta codigo"}), 400
     if codigo in salas_activas:
         sala = salas_activas[codigo]
+        if rol in ("spectator", "espectador"):
+            # El espectador solo baja el contador, NUNCA toca player2.
+            # Antes el cliente ni siquiera avisaba que era espectador.
+            sala["espectadores"] = max(0, sala.get("espectadores", 0) - 1)
+            _save_salas()
+            print(f"[SALIR] espectador {jugador} salio de {codigo}")
+            return jsonify({"status": "ok", "codigo": codigo})
         actual = (sala.get("player2") or "").strip()
         if not jugador or not actual or actual.lower() == jugador.lower():
             sala["player2"] = ""; sala["player2_time"] = 0
             sala["player2_country_code"] = ""; sala["player2_pais"] = ""; sala["player2_flag"] = "🌐"
+            sala["status"] = "esperando"
             _save_salas()
             print(f"[SALIR] {jugador} salio de {codigo}")
     return jsonify({"status": "ok", "codigo": codigo})
@@ -274,7 +308,10 @@ def borrar_por_salas(codigo):
     codigo = _extraer_codigo(codigo)
     _load_salas()
     if request.method == 'GET':
-        if codigo in salas_activas: return jsonify(salas_activas[codigo])
+        if codigo in salas_activas:
+            _s = dict(salas_activas[codigo])
+            _s["status"] = "en_curso" if _s.get("player2") else "esperando"
+            return jsonify(_s)
         return jsonify({"error": "Sala no encontrada"}), 404
     _borrar(codigo); return jsonify({"status": "borrado", "codigo": codigo})
 
