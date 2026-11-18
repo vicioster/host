@@ -11,7 +11,10 @@ salas_activas = {}
 # de cada worker es distinto y un worker borra pero otro sigue listando la sala.
 # Con archivo, todos leen/escriben el mismo estado.
 _SALAS_FILE = Path(os.environ.get("SALAS_FILE", "/tmp/salas_activas.json"))
-_SALAS_LOCK = threading.Lock()
+# RLock: _load/_save tambien lo toman, y las requests lo toman entero
+# (load -> modificar -> save). Sin esto, un keepalive del host y un
+# /unirse del P2 que llegaban juntos se pisaban y el P2 desaparecia.
+_SALAS_LOCK = threading.RLock()
 
 def _load_salas():
     try:
@@ -143,6 +146,29 @@ def _extraer_jugador():
             if request.form.get(k): return str(request.form.get(k)).strip()
     return (request.args.get("jugador") or request.args.get("name") or "").strip()
 
+def _sala_estado(codigo: str, sala: dict) -> dict:
+    """Unica fuente de verdad para 'hay 2 jugadores?'."""
+    p2 = (sala.get("player2") or "").strip()
+    host = (sala.get("host") or "").strip()
+    status = "en_curso" if p2 else "esperando"
+    return {"codigo": (codigo or "").strip().upper(), "host": host, "player2": p2,
+            "status": status, "llena": bool(p2), "jugadores": 2 if p2 else 1,
+            "espectadores": sala.get("espectadores", 0), "juego": sala.get("juego", "")}
+
+def _releer_p2_desde_archivo(codigo: str) -> dict:
+    """Lee el archivo SIN tocar salas_activas. Sirve para fusionar un P2
+    que entro JUSTO entre el load y el save del keepalive del host."""
+    try:
+        if _SALAS_FILE.exists():
+            data = json.loads(_SALAS_FILE.read_text(encoding="utf-8") or "{}")
+            if isinstance(data, dict):
+                v = data.get((codigo or "").strip().upper()) or {}
+                if isinstance(v, dict):
+                    return v
+    except Exception:
+        pass
+    return {}
+
 def _borrar(codigo: str) -> bool:
     codigo = (codigo or "").strip().upper()
     if not codigo: return False
@@ -163,6 +189,10 @@ def crear_sala():
     juego = data.get("juego", "Juego desconocido"); host = data.get("host", "Player")
     if not codigo or not ip or not puerto or not es_codigo_valido(codigo):
         return jsonify({"error": "Código inválido o prohibido"}), 400
+    with _SALAS_LOCK:
+        return _crear_sala_locked(codigo, ip, puerto, juego, host, data)
+
+def _crear_sala_locked(codigo, ip, puerto, juego, host, data):
     limpiar_expiradas()
     # Borrar otras salas del mismo IP (excepto esta misma, para permitir keepalive)
     for k in list(salas_activas.keys()):
@@ -187,6 +217,19 @@ def crear_sala():
         "host_country_code": code, "host_pais": name, "host_flag": flag,
         "country_code": code, "pais": name, "flag": flag,
     }
+    # Fusion: si el P2 entro justo entre el load y este save, el archivo
+    # ya lo tiene y nuestro 'prev' no. Sin esto el keepalive lo borraba.
+    _fresco = _releer_p2_desde_archivo(codigo)
+    _p2_fresco = (_fresco.get("player2") or "").strip()
+    if _p2_fresco and not salas_activas[codigo].get("player2"):
+        salas_activas[codigo]["player2"] = _p2_fresco
+        salas_activas[codigo]["player2_time"] = _fresco.get("player2_time", time.time())
+        salas_activas[codigo]["player2_country_code"] = _fresco.get("player2_country_code", "")
+        salas_activas[codigo]["player2_pais"] = _fresco.get("player2_pais", "")
+        salas_activas[codigo]["player2_flag"] = _fresco.get("player2_flag", "🌐")
+        salas_activas[codigo]["status"] = "en_curso"
+        salas_activas[codigo]["espectadores"] = max(
+            salas_activas[codigo].get("espectadores", 0), _fresco.get("espectadores", 0))
     _save_salas()
     print(f"[CREAR] {codigo} -> {ip}:{puerto} ({juego}) por {host} {flag} {code}")
     return jsonify({"status": "ok", "codigo": codigo})
@@ -201,6 +244,8 @@ def listar_salas():
         v = dict(v)
         # Status explicito para que el cliente no dependa solo del nombre del P2
         v["status"] = "en_curso" if v.get("player2") else "esperando"
+        v["llena"] = bool(v.get("player2"))
+        v["jugadores"] = 2 if v.get("player2") else 1
         out[k] = v
     return jsonify(out)
 
@@ -214,6 +259,8 @@ def unirse_sala(codigo):
     if request.method == 'GET':
         _s = dict(sala)
         _s["status"] = "en_curso" if _s.get("player2") else "esperando"
+        _s["llena"] = bool(_s.get("player2"))
+        _s["jugadores"] = 2 if _s.get("player2") else 1
         return jsonify(_s)
     data = request.get_json(silent=True) or {}
     rol = (data.get("rol") or "").strip().lower()
@@ -303,6 +350,18 @@ def cerrar_sala(codigo=None):
 def ping():
     return jsonify({"status": "ok"})
 
+@app.route('/estado/<codigo>', methods=['GET'])
+@app.route('/estado', methods=['GET', 'POST'])
+def estado_sala(codigo=None):
+    # Endpoint dedicado SOLO para preguntar "hay 2 jugadores?".
+    # El cliente lo consulta en el doble click, sin depender de /salas.
+    codigo = _extraer_codigo(codigo)
+    with _SALAS_LOCK:
+        _load_salas()
+        if not codigo or codigo not in salas_activas:
+            return jsonify({"error": "Sala no encontrada", "llena": False, "jugadores": 0}), 404
+        return jsonify(_sala_estado(codigo, salas_activas[codigo]))
+
 @app.route('/salas/<codigo>', methods=['DELETE','GET'])
 def borrar_por_salas(codigo):
     codigo = _extraer_codigo(codigo)
@@ -311,6 +370,8 @@ def borrar_por_salas(codigo):
         if codigo in salas_activas:
             _s = dict(salas_activas[codigo])
             _s["status"] = "en_curso" if _s.get("player2") else "esperando"
+            _s["llena"] = bool(_s.get("player2"))
+            _s["jugadores"] = 2 if _s.get("player2") else 1
             return jsonify(_s)
         return jsonify({"error": "Sala no encontrada"}), 404
     _borrar(codigo); return jsonify({"status": "borrado", "codigo": codigo})
