@@ -39,11 +39,34 @@ def _save_salas():
 # Chat general del lobby (mockup): historial compartido por todos los que
 # tienen la app abierta, no por sala. Mismo patron que las salas: lista en
 # memoria + archivo en /tmp para que varios workers de Render vean lo mismo.
-# Maximo 100 mensajes, los viejos se podan. No expira por tiempo: el historial
-# queda hasta que Render reinicia (como las salas, que expiran por keepalive).
+# Maximo 100 mensajes + TTL 10 MIN (1.9.1): cada mensaje expira a los
+# 10 min de enviado (rolling por mensaje, no borrado total a hora fija).
+# Asi el chat no se satura. Se poda en GET, en POST y al cargar del archivo.
+_CHAT_TTL = 600  # segundos = 10 min
 _mensajes_chat: list[dict] = []
 _CHAT_FILE = Path(os.environ.get("CHAT_FILE", "/tmp/chat_mensajes.json"))
 _CHAT_LOCK = threading.RLock()
+
+def _chat_msg_ts(m: dict) -> float:
+    """Timestamp de un mensaje. Sin ts (viejo), usa el id (que era str(time))."""
+    try:
+        _ts = m.get("ts")
+        if _ts is not None:
+            return float(_ts)
+        return float(m.get("id") or 0)
+    except Exception:
+        return 0.0
+
+def _prune_chat_locked() -> int:
+    """Borra mensajes con mas de 10 min. Asume _CHAT_LOCK tomado (es RLock)."""
+    try:
+        _now = time.time()
+        _before = len(_mensajes_chat)
+        _mensajes_chat[:] = [m for m in _mensajes_chat
+                             if isinstance(m, dict) and (_now - _chat_msg_ts(m)) <= _CHAT_TTL]
+        return _before - len(_mensajes_chat)
+    except Exception:
+        return 0
 
 def _load_chat():
     try:
@@ -53,6 +76,7 @@ def _load_chat():
                 if isinstance(data, list):
                     _mensajes_chat.clear()
                     _mensajes_chat.extend([m for m in data if isinstance(m, dict)])
+            _prune_chat_locked()
     except Exception as e:
         print(f"[CHAT] load error: {e}")
 
@@ -381,6 +405,11 @@ def cerrar_sala(codigo=None):
 @app.route('/mensajes', methods=['GET'])
 def listar_chat():
     _load_chat()
+    # 1.9.1: si el prune saco viejos al cargar, persistir el recorte.
+    try:
+        _save_chat()
+    except Exception:
+        pass
     return jsonify(_mensajes_chat[-100:])
 
 @app.route('/chat', methods=['POST'])
@@ -395,7 +424,7 @@ def enviar_chat():
         if not texto:
             return jsonify({"ok": False, "error": "mensaje vacio"}), 400
         with _CHAT_LOCK:
-            _load_chat()
+            _load_chat()  # ya poda los de mas de 10 min
             _mensajes_chat.append({"nick": nick[:30], "mensaje": texto, "texto": texto, "id": str(time.time()), "ts": time.time()})
             del _mensajes_chat[:-100]
             _save_chat()
