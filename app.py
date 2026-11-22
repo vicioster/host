@@ -35,6 +35,36 @@ def _save_salas():
             tmp.replace(_SALAS_FILE)
     except Exception as e:
         print(f"[SALAS] save error: {e}")
+# ================= 1.9.0 CHAT =================
+# Chat general del lobby (mockup): historial compartido por todos los que
+# tienen la app abierta, no por sala. Mismo patron que las salas: lista en
+# memoria + archivo en /tmp para que varios workers de Render vean lo mismo.
+# Maximo 100 mensajes, los viejos se podan. No expira por tiempo: el historial
+# queda hasta que Render reinicia (como las salas, que expiran por keepalive).
+_mensajes_chat: list[dict] = []
+_CHAT_FILE = Path(os.environ.get("CHAT_FILE", "/tmp/chat_mensajes.json"))
+_CHAT_LOCK = threading.RLock()
+
+def _load_chat():
+    try:
+        with _CHAT_LOCK:
+            if _CHAT_FILE.exists():
+                data = json.loads(_CHAT_FILE.read_text(encoding="utf-8") or "[]")
+                if isinstance(data, list):
+                    _mensajes_chat.clear()
+                    _mensajes_chat.extend([m for m in data if isinstance(m, dict)])
+    except Exception as e:
+        print(f"[CHAT] load error: {e}")
+
+def _save_chat():
+    try:
+        with _CHAT_LOCK:
+            tmp = _CHAT_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(_mensajes_chat[-100:]), encoding="utf-8")
+            tmp.replace(_CHAT_FILE)
+    except Exception as e:
+        print(f"[CHAT] save error: {e}")
+
 _country_cache = {}
 _country_lock = threading.Lock()
 
@@ -346,6 +376,34 @@ def cerrar_sala(codigo=None):
     if not codigo: return jsonify({"error": "falta codigo"}), 400
     _borrar(codigo); return jsonify({"status": "borrado", "codigo": codigo})
 
+# ---- CHAT ----
+@app.route('/chat', methods=['GET'])
+@app.route('/mensajes', methods=['GET'])
+def listar_chat():
+    _load_chat()
+    return jsonify(_mensajes_chat[-100:])
+
+@app.route('/chat', methods=['POST'])
+@app.route('/mensajes', methods=['POST'])
+def enviar_chat():
+    try:
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            data = {}
+        nick = str(data.get("nick") or data.get("nickname") or data.get("nombre") or data.get("user") or "pc").strip() or "pc"
+        texto = str(data.get("mensaje") or data.get("texto") or data.get("message") or data.get("text") or data.get("msg") or "").replace("\n", " ").replace("\r", " ").strip()[:300]
+        if not texto:
+            return jsonify({"ok": False, "error": "mensaje vacio"}), 400
+        with _CHAT_LOCK:
+            _load_chat()
+            _mensajes_chat.append({"nick": nick[:30], "mensaje": texto, "texto": texto, "id": str(time.time()), "ts": time.time()})
+            del _mensajes_chat[:-100]
+            _save_chat()
+        return jsonify({"ok": True, "mensajes": _mensajes_chat[-100:]})
+    except Exception as e:
+        print(f"[CHAT] post error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route('/ping', methods=['GET'])
 def ping():
     return jsonify({"status": "ok"})
@@ -379,7 +437,8 @@ def borrar_por_salas(codigo):
 @app.route('/', methods=['GET'])
 def index():
     _load_salas()
-    return jsonify({"status": "ok", "salas_activas": len(salas_activas)})
+    _load_chat()
+    return jsonify({"status": "ok", "salas_activas": len(salas_activas), "chat_mensajes": len(_mensajes_chat)})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
