@@ -423,9 +423,19 @@ def enviar_chat():
         texto = str(data.get("mensaje") or data.get("texto") or data.get("message") or data.get("text") or data.get("msg") or "").replace("\n", " ").replace("\r", " ").strip()[:300]
         if not texto:
             return jsonify({"ok": False, "error": "mensaje vacio"}), 400
+        # 1.9.3 FIX DUPLICADOS: el cliente manda client_id (uno por mensaje,
+        # compartido por su eco local y este POST). Se guarda en el mensaje
+        # para que el GET lo devuelva y el cliente reconozca el eco del
+        # server como EL MISMO mensaje. El id sigue siendo el ts del server
+        # (lo usa _chat_msg_ts como fallback si falta ts).
+        _client_id = str(data.get("client_id") or data.get("cid") or data.get("client_key") or "").strip()[:80]
         with _CHAT_LOCK:
             _load_chat()  # ya poda los de mas de 10 min
-            _mensajes_chat.append({"nick": nick[:30], "mensaje": texto, "texto": texto, "id": str(time.time()), "ts": time.time()})
+            # Dedupe en server: si este client_id ya esta guardado (POST
+            # repetido / reintento / doble click), no guardarlo de nuevo.
+            if _client_id and any(isinstance(m, dict) and m.get("client_id") == _client_id for m in _mensajes_chat):
+                return jsonify({"ok": True, "mensajes": _mensajes_chat[-100:], "duplicado": True})
+            _mensajes_chat.append({"nick": nick[:30], "mensaje": texto, "texto": texto, "id": str(time.time()), "ts": time.time(), "client_id": _client_id})
             del _mensajes_chat[:-100]
             _save_chat()
         return jsonify({"ok": True, "mensajes": _mensajes_chat[-100:]})
