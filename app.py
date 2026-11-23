@@ -39,34 +39,22 @@ def _save_salas():
 # Chat general del lobby (mockup): historial compartido por todos los que
 # tienen la app abierta, no por sala. Mismo patron que las salas: lista en
 # memoria + archivo en /tmp para que varios workers de Render vean lo mismo.
-# Maximo 100 mensajes + TTL 10 MIN (1.9.1): cada mensaje expira a los
-# 10 min de enviado (rolling por mensaje, no borrado total a hora fija).
-# Asi el chat no se satura. Se poda en GET, en POST y al cargar del archivo.
+# Maximo 100 mensajes, los viejos se podan.
+# 1.9.3 FIX DUPLICADOS (lado server, el que faltaba):
+# El cliente 1.9.3 ya manda UN client_id unico por mensaje (lo genera en
+# _chat_send) y el eco local usa esa misma clave. PERO el server lo ignoraba:
+# guardaba id=str(time.time()) y no devolvia client_id, asi que el eco del
+# server NUNCA coincidia con el eco local y _chat_seen no lo deduplicaba.
+# El unico freno era "mismo nick+texto hace <10s", que falla si Render tarda
+# >10s en despertar (cold start) -> el mensaje aparecia 2 veces, como en la
+# captura. Ahora el server guarda y devuelve client_id, y el POST es
+# idempotente: si llega 2 veces el mismo client_id (reintento / doble POST),
+# no se agrega 2 veces.
+# Tambien TTL 10 min por mensaje (rolling), igual que el cliente 1.9.1+.
 _CHAT_TTL = 600  # segundos = 10 min
 _mensajes_chat: list[dict] = []
 _CHAT_FILE = Path(os.environ.get("CHAT_FILE", "/tmp/chat_mensajes.json"))
 _CHAT_LOCK = threading.RLock()
-
-def _chat_msg_ts(m: dict) -> float:
-    """Timestamp de un mensaje. Sin ts (viejo), usa el id (que era str(time))."""
-    try:
-        _ts = m.get("ts")
-        if _ts is not None:
-            return float(_ts)
-        return float(m.get("id") or 0)
-    except Exception:
-        return 0.0
-
-def _prune_chat_locked() -> int:
-    """Borra mensajes con mas de 10 min. Asume _CHAT_LOCK tomado (es RLock)."""
-    try:
-        _now = time.time()
-        _before = len(_mensajes_chat)
-        _mensajes_chat[:] = [m for m in _mensajes_chat
-                             if isinstance(m, dict) and (_now - _chat_msg_ts(m)) <= _CHAT_TTL]
-        return _before - len(_mensajes_chat)
-    except Exception:
-        return 0
 
 def _load_chat():
     try:
@@ -76,7 +64,15 @@ def _load_chat():
                 if isinstance(data, list):
                     _mensajes_chat.clear()
                     _mensajes_chat.extend([m for m in data if isinstance(m, dict)])
-            _prune_chat_locked()
+                    # 1.9.3: podar por TTL 10 min (rolling por mensaje, igual
+                    # que el cliente). Sin ts valido se conserva (seguro).
+                    try:
+                        _ahora = time.time()
+                        _mensajes_chat[:] = [m for m in _mensajes_chat
+                                             if not isinstance(m.get("ts"), (int, float))
+                                             or (_ahora - m["ts"]) <= _CHAT_TTL]
+                    except Exception:
+                        pass
     except Exception as e:
         print(f"[CHAT] load error: {e}")
 
@@ -405,11 +401,6 @@ def cerrar_sala(codigo=None):
 @app.route('/mensajes', methods=['GET'])
 def listar_chat():
     _load_chat()
-    # 1.9.1: si el prune saco viejos al cargar, persistir el recorte.
-    try:
-        _save_chat()
-    except Exception:
-        pass
     return jsonify(_mensajes_chat[-100:])
 
 @app.route('/chat', methods=['POST'])
@@ -423,19 +414,20 @@ def enviar_chat():
         texto = str(data.get("mensaje") or data.get("texto") or data.get("message") or data.get("text") or data.get("msg") or "").replace("\n", " ").replace("\r", " ").strip()[:300]
         if not texto:
             return jsonify({"ok": False, "error": "mensaje vacio"}), 400
-        # 1.9.3 FIX DUPLICADOS: el cliente manda client_id (uno por mensaje,
-        # compartido por su eco local y este POST). Se guarda en el mensaje
-        # para que el GET lo devuelva y el cliente reconozca el eco del
-        # server como EL MISMO mensaje. El id sigue siendo el ts del server
-        # (lo usa _chat_msg_ts como fallback si falta ts).
-        _client_id = str(data.get("client_id") or data.get("cid") or data.get("client_key") or "").strip()[:80]
+        # 1.9.3: client_id del cliente (unico por mensaje). Sin el, el cliente
+        # no puede deduplicar el eco del server y el mensaje sale 2 veces.
+        _cid = str(data.get("client_id") or data.get("cid") or data.get("client_key") or "").strip()
         with _CHAT_LOCK:
-            _load_chat()  # ya poda los de mas de 10 min
-            # Dedupe en server: si este client_id ya esta guardado (POST
-            # repetido / reintento / doble click), no guardarlo de nuevo.
-            if _client_id and any(isinstance(m, dict) and m.get("client_id") == _client_id for m in _mensajes_chat):
-                return jsonify({"ok": True, "mensajes": _mensajes_chat[-100:], "duplicado": True})
-            _mensajes_chat.append({"nick": nick[:30], "mensaje": texto, "texto": texto, "id": str(time.time()), "ts": time.time(), "client_id": _client_id})
+            _load_chat()
+            # 1.9.3 IDEMPOTENCIA: si ya existe un mensaje con este client_id
+            # (reintento del cliente, doble POST, Render reintenta), NO
+            # agregar otro. Devolver el historial tal cual.
+            if _cid and any(str(m.get("client_id") or "") == _cid for m in _mensajes_chat):
+                return jsonify({"ok": True, "duplicado": True, "mensajes": _mensajes_chat[-100:]})
+            _msg = {"nick": nick[:30], "mensaje": texto, "texto": texto, "id": str(time.time()), "ts": time.time()}
+            if _cid:
+                _msg["client_id"] = _cid
+            _mensajes_chat.append(_msg)
             del _mensajes_chat[:-100]
             _save_chat()
         return jsonify({"ok": True, "mensajes": _mensajes_chat[-100:]})
