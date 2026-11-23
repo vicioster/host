@@ -465,11 +465,16 @@ def borrar_por_salas(codigo):
         return jsonify({"error": "Sala no encontrada"}), 404
     _borrar(codigo); return jsonify({"status": "borrado", "codigo": codigo})
 
+SERVER_VERSION = "1.9.3"
+
 @app.route('/', methods=['GET'])
 def index():
     _load_salas()
     _load_chat()
-    return jsonify({"status": "ok", "salas_activas": len(salas_activas), "chat_mensajes": len(_mensajes_chat)})
+    # 1.9.3: marcador para verificar en el navegador que version esta viva:
+    # abrir https://host-1-uray.onrender.com/ debe decir server_version 1.9.3.
+    # Si dice otra cosa o no dice nada, Render esta corriendo un app.py viejo.
+    return jsonify({"status": "ok", "server_version": SERVER_VERSION, "salas_activas": len(salas_activas), "chat_mensajes": len(_mensajes_chat)})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
