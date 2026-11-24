@@ -435,6 +435,41 @@ def enviar_chat():
         print(f"[CHAT] post error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
+# ================= 1.9.5 CONECTADOS =================
+# Presencia en memoria: cada app abierta hace POST cada 10s con su nick.
+# Sin heartbeat en 30s se considera desconectada y sale de la lista.
+# Misma idea que el chat: si Render corre con varios workers, cada worker
+# ve solo a los que le hicieron heartbeat a EL. Con 1 worker (plan actual)
+# la lista es completa; si algun dia hay mas workers, habria que pasar
+# esto a archivo como las salas. Por ahora, en memoria es suficiente.
+_PRESENCE_TTL = 30  # segundos
+_PRESENCE = {}  # nick -> last_seen (float)
+_PRESENCE_LOCK = threading.Lock()
+
+def _presence_online():
+    _ahora = time.time()
+    with _PRESENCE_LOCK:
+        for _k in [k for k, v in _PRESENCE.items() if (_ahora - v) > _PRESENCE_TTL]:
+            del _PRESENCE[_k]
+        return sorted(_PRESENCE.keys())
+
+@app.route('/presence', methods=['GET', 'POST'])
+@app.route('/presencia', methods=['GET', 'POST'])
+def presence():
+    try:
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            if not isinstance(data, dict):
+                data = {}
+            nick = str(data.get("nick") or data.get("nickname") or data.get("nombre") or data.get("user") or "pc").strip()[:30] or "pc"
+            with _PRESENCE_LOCK:
+                _PRESENCE[nick] = time.time()
+        _online = _presence_online()
+        return jsonify({"ok": True, "online": _online, "conectados": _online, "count": len(_online)})
+    except Exception as e:
+        print(f"[PRESENCE] error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route('/ping', methods=['GET'])
 def ping():
     return jsonify({"status": "ok"})
@@ -465,16 +500,16 @@ def borrar_por_salas(codigo):
         return jsonify({"error": "Sala no encontrada"}), 404
     _borrar(codigo); return jsonify({"status": "borrado", "codigo": codigo})
 
-SERVER_VERSION = "1.9.3"
+SERVER_VERSION = "1.9.4"
 
 @app.route('/', methods=['GET'])
 def index():
     _load_salas()
     _load_chat()
-    # 1.9.3: marcador para verificar en el navegador que version esta viva:
-    # abrir https://host-1-uray.onrender.com/ debe decir server_version 1.9.3.
+    # 1.9.4: marcador para verificar en el navegador que version esta viva:
+    # abrir https://host-1-uray.onrender.com/ debe decir server_version 1.9.4.
     # Si dice otra cosa o no dice nada, Render esta corriendo un app.py viejo.
-    return jsonify({"status": "ok", "server_version": SERVER_VERSION, "salas_activas": len(salas_activas), "chat_mensajes": len(_mensajes_chat)})
+    return jsonify({"status": "ok", "server_version": SERVER_VERSION, "salas_activas": len(salas_activas), "chat_mensajes": len(_mensajes_chat), "conectados": len(_presence_online())})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
